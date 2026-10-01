@@ -1,0 +1,248 @@
+{
+ "spec_base": "configs/ensembles/cosmos25_census_v2_hfree_xu23_rolls.yaml",
+ "spec_resolved": "work/spec_seed1.yaml",
+ "seed": 1,
+ "n_selected_galaxies": 2929,
+ "n_galaxies_in_file": 100,
+ "snr_line_total_min_label": 5.0,
+ "observation_config_id": "hlwas_medium_roman_rotac_rolls_poisson",
+ "noise_model": "poisson",
+ "render_oversample": 5,
+ "pixel_scale_arcsec": 0.11,
+ "grism_rolls_deg": [
+  0.0,
+  10.0,
+  167.0,
+  177.0
+ ],
+ "grism_dispersion_nm_per_pix": 1.1,
+ "jitter": {
+  "logm_dex": 0.1,
+  "f_line_dex": 0.1,
+  "ew_dex": 0.1,
+  "size_dex": 0.1,
+  "band_flux_dex": 0.1,
+  "z_halfwidth": 0.05
+ },
+ "theta_int": "population draw U(0, pi) plus a seeded random pi flip per row (theta_flipped); fit prior is CircularUniform(0, 2 pi)",
+ "shear_frame": "truth.g_plus / g_cross = sky (g1, g2) rotated by 2 theta_int (kl_pipe.coordinates.rotate_to_galaxy_frame)",
+ "frames": "img.bb_*: detector = sky (no WCS rotation); img.gr_rollj: sky rotated by roll_deg_j, dispersion along array axis 1",
+ "units": {
+  "img.bb_*": "uJy per pixel (band-averaged f_nu)",
+  "img.gr_*": "1e-17 erg/s/cm2 per pixel (dispersed line + continuum)",
+  "img.*_var": "per-pixel variance, squared stamp units: sigma_bkg^2 + max(clean, 0) / gain",
+  "img.*_clean": "noiseless truth stamp the noise was added to (mock-fidelity PSF)",
+  "sigma_bkg.*": "flat background sigma per pixel, stamp units (published-depth anchor)",
+  "gain.*": "detected electrons per stamp flux unit (shot-noise term)",
+  "snr_eff.*": "realized matched-filter SNR of the noiseless truth against the variance map; line_* use the line-only template",
+  "line_snr / broadband_snr_*": "labeled per-pass line SNR and per-band SNR from the population proxy (selection axis, not the noise generator)"
+ },
+ "array_layout": "img.* = fixed-size list<float32>, row-major; reshape to image_shapes[key]",
+ "workers": 8,
+ "ring_members": 1,
+ "t_population_s": 22.401679754257202,
+ "t_rows_s": 76.49305605888367,
+ "constant_columns": {
+  "ring_member": 0,
+  "ring_partner_id": "",
+  "noise_rep": 0,
+  "observation_config_id": "hlwas_medium_roman_rotac_rolls_poisson",
+  "db_seed": 1,
+  "prior.F129.flux.dist": "truncated_normal",
+  "prior.F129.flux.low": 0.05,
+  "prior.F129.flux.high": 2000.0,
+  "prior.F129.rscale.dist": "truncated_lognormal",
+  "prior.F129.rscale.loc": -1.7822008619773915,
+  "prior.F129.rscale.scale": 0.3707161999720414,
+  "prior.F129.rscale.low": 0.005,
+  "prior.F129.rscale.high": 3.0,
+  "prior.F129.x0.dist": "truncated_normal",
+  "prior.F129.x0.loc": 0.0,
+  "prior.F129.x0.scale": 0.11,
+  "prior.F129.x0.low": -0.5,
+  "prior.F129.x0.high": 0.5,
+  "prior.F129.y0.dist": "truncated_normal",
+  "prior.F129.y0.loc": 0.0,
+  "prior.F129.y0.scale": 0.11,
+  "prior.F129.y0.low": -0.5,
+  "prior.F129.y0.high": 0.5,
+  "prior.F158.flux.dist": "truncated_normal",
+  "prior.F158.flux.low": 0.05,
+  "prior.F158.flux.high": 2000.0,
+  "prior.F158.rscale.dist": "truncated_lognormal",
+  "prior.F158.rscale.loc": -1.7822008619773915,
+  "prior.F158.rscale.scale": 0.3707161999720414,
+  "prior.F158.rscale.low": 0.005,
+  "prior.F158.rscale.high": 3.0,
+  "prior.F158.x0.dist": "truncated_normal",
+  "prior.F158.x0.loc": 0.0,
+  "prior.F158.x0.scale": 0.11,
+  "prior.F158.x0.low": -0.5,
+  "prior.F158.x0.high": 0.5,
+  "prior.F158.y0.dist": "truncated_normal",
+  "prior.F158.y0.loc": 0.0,
+  "prior.F158.y0.scale": 0.11,
+  "prior.F158.y0.low": -0.5,
+  "prior.F158.y0.high": 0.5,
+  "prior.Halpha.cont.flux_per_nm.dist": "truncated_lognormal",
+  "prior.Halpha.cont.flux_per_nm.loc": -0.7920892719899517,
+  "prior.Halpha.cont.flux_per_nm.scale": 0.7782737614319876,
+  "prior.Halpha.cont.flux_per_nm.low": 0.005,
+  "prior.Halpha.cont.flux_per_nm.high": 500.0,
+  "prior.Halpha.cont.rscale.dist": "truncated_lognormal",
+  "prior.Halpha.cont.rscale.loc": -1.7822008619773915,
+  "prior.Halpha.cont.rscale.scale": 0.3707161999720414,
+  "prior.Halpha.cont.rscale.low": 0.005,
+  "prior.Halpha.cont.rscale.high": 3.0,
+  "prior.Halpha.cont.x0.dist": "truncated_normal",
+  "prior.Halpha.cont.x0.loc": 0.0,
+  "prior.Halpha.cont.x0.scale": 0.12298373876248843,
+  "prior.Halpha.cont.x0.low": -0.5,
+  "prior.Halpha.cont.x0.high": 0.5,
+  "prior.Halpha.cont.y0.dist": "truncated_normal",
+  "prior.Halpha.cont.y0.loc": 0.0,
+  "prior.Halpha.cont.y0.scale": 0.12298373876248843,
+  "prior.Halpha.cont.y0.low": -0.5,
+  "prior.Halpha.cont.y0.high": 0.5,
+  "prior.Halpha.dispersion.dist": "truncated_normal",
+  "prior.Halpha.dispersion.scale": 11.3,
+  "prior.Halpha.dispersion.low": 5.0,
+  "prior.Halpha.dispersion.high": 150.0,
+  "prior.Halpha.flux.dist": "truncated_normal",
+  "prior.Halpha.flux.low": 5.0,
+  "prior.Halpha.flux.high": 5000.0,
+  "prior.Halpha.rscale.dist": "conditional_lognormal",
+  "prior.Halpha.rscale.parent": "F129.rscale",
+  "prior.Halpha.rscale.loc": 0.26236426446749106,
+  "prior.Halpha.rscale.scale": 0.4605170185988092,
+  "prior.Halpha.rscale.low": 0.005,
+  "prior.Halpha.rscale.high": 3.0,
+  "prior.Halpha.x0.dist": "truncated_normal",
+  "prior.Halpha.x0.loc": 0.0,
+  "prior.Halpha.x0.scale": 0.11,
+  "prior.Halpha.x0.low": -0.5,
+  "prior.Halpha.x0.high": 0.5,
+  "prior.Halpha.y0.dist": "truncated_normal",
+  "prior.Halpha.y0.loc": 0.0,
+  "prior.Halpha.y0.scale": 0.11,
+  "prior.Halpha.y0.low": -0.5,
+  "prior.Halpha.y0.high": 0.5,
+  "prior.cosi.dist": "uniform",
+  "prior.cosi.loc": null,
+  "prior.cosi.scale": null,
+  "prior.cosi.low": 0.05,
+  "prior.cosi.high": 0.95,
+  "prior.g1.dist": "gaussian",
+  "prior.g1.loc": 0.0,
+  "prior.g1.scale": 0.2,
+  "prior.g1.low": null,
+  "prior.g1.high": null,
+  "prior.g2.dist": "gaussian",
+  "prior.g2.loc": 0.0,
+  "prior.g2.scale": 0.2,
+  "prior.g2.low": null,
+  "prior.g2.high": null,
+  "prior.h_over_r.dist": "lognormal",
+  "prior.h_over_r.loc": -1.3862943611198906,
+  "prior.h_over_r.scale": 0.32236191301916645,
+  "prior.h_over_r.low": null,
+  "prior.h_over_r.high": null,
+  "prior.theta_int.dist": "circular_uniform",
+  "prior.theta_int.loc": null,
+  "prior.theta_int.scale": null,
+  "prior.theta_int.low": 0.0,
+  "prior.theta_int.high": 6.283185307179586,
+  "prior.vel.rscale.dist": "conditional_lognormal",
+  "prior.vel.rscale.parent": "F129.rscale",
+  "prior.vel.rscale.loc": -0.6931471805599453,
+  "prior.vel.rscale.scale": 0.6907755278982137,
+  "prior.vel.rscale.low": 0.005,
+  "prior.vel.rscale.high": 3.0,
+  "prior.vel.v0.dist": "gaussian",
+  "prior.vel.v0.loc": 0.0,
+  "prior.vel.v0.scale": 125.0,
+  "prior.vel.v0.low": null,
+  "prior.vel.v0.high": null,
+  "prior.vel.vcirc.dist": "lognormal",
+  "prior.vel.vcirc.scale": 0.11282666955670825,
+  "prior.vel.vcirc.low": null,
+  "prior.vel.vcirc.high": null,
+  "sampled_names": "F129.flux,F129.rscale,F129.x0,F129.y0,F158.flux,F158.rscale,F158.x0,F158.y0,Halpha.cont.flux_per_nm,Halpha.cont.rscale,Halpha.cont.x0,Halpha.cont.y0,Halpha.dispersion,Halpha.flux,Halpha.rscale,Halpha.x0,Halpha.y0,cosi,g1,g2,h_over_r,theta_int,vel.rscale,vel.v0,vel.vcirc"
+ },
+ "image_shapes": {
+  "bb_F129": [
+   32,
+   32
+  ],
+  "bb_F129_var": [
+   32,
+   32
+  ],
+  "bb_F158": [
+   32,
+   32
+  ],
+  "bb_F158_var": [
+   32,
+   32
+  ],
+  "gr_roll0": [
+   32,
+   32
+  ],
+  "gr_roll0_var": [
+   32,
+   32
+  ],
+  "gr_roll1": [
+   32,
+   32
+  ],
+  "gr_roll1_var": [
+   32,
+   32
+  ],
+  "gr_roll2": [
+   32,
+   32
+  ],
+  "gr_roll2_var": [
+   32,
+   32
+  ],
+  "gr_roll3": [
+   32,
+   32
+  ],
+  "gr_roll3_var": [
+   32,
+   32
+  ],
+  "bb_F129_clean": [
+   32,
+   32
+  ],
+  "bb_F158_clean": [
+   32,
+   32
+  ],
+  "gr_roll0_clean": [
+   32,
+   32
+  ],
+  "gr_roll1_clean": [
+   32,
+   32
+  ],
+  "gr_roll2_clean": [
+   32,
+   32
+  ],
+  "gr_roll3_clean": [
+   32,
+   32
+  ]
+ },
+ "n_rows": 100,
+ "n_columns": 121
+}
