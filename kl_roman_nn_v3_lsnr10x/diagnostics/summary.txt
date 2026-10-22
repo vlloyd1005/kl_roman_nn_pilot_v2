@@ -1,0 +1,27 @@
+file seed00001.parquet: 1128 rows, 123 columns in the file (18 image, 105 scalar; 125 constants in meta), 79.1 MB = 70.2 KB/row
+unique catalog galaxies 1128, ring members per galaxy {1: 1128}, of 5059 candidates (label prefilter 3.5), kept at realized baseline total >= 10.0 x depth 10.0
+theta_int range [0.004, 6.283], flipped fraction 0.48
+noise model poisson, oversample 5, rolls [0.0, 10.0, 167.0, 177.0]
+  sigma_bkg.bb_F129: unique values 1 = 0.006846; gain range 6906-6906
+  sigma_bkg.bb_F158: unique values 1 = 0.006059; gain range 7129-7129
+  sigma_bkg.gr_roll0: unique values 1 = 0.05589; gain range 2722-6810
+  sigma_bkg.gr_roll1: unique values 1 = 0.05589; gain range 2722-6810
+  sigma_bkg.gr_roll2: unique values 1 = 0.05589; gain range 2722-6810
+  sigma_bkg.gr_roll3: unique values 1 = 0.05589; gain range 2722-6810
+  pull bb_F129: mean +0.0000 std 0.9986 (N 1155072, expect 1 +/- 0.0007)
+  pull bb_F158: mean -0.0006 std 0.9991 (N 1155072, expect 1 +/- 0.0007)
+  pull gr_roll0: mean +0.0009 std 0.9993 (N 1155072, expect 1 +/- 0.0007)
+  pull gr_roll1: mean -0.0001 std 0.9995 (N 1155072, expect 1 +/- 0.0007)
+  pull gr_roll2: mean +0.0003 std 0.9993 (N 1155072, expect 1 +/- 0.0007)
+  pull gr_roll3: mean -0.0005 std 1.0006 (N 1155072, expect 1 +/- 0.0007)
+chi2/N at truth over rows: mean 0.9988 std 0.0177 (expect 1 +/- 0.0180 per row)
+realized/label total line SNR: median 9.209, p5 5.412, p95 15.724
+realized total line SNR: p5/p50/p95 [103.02, 151.53, 381.55]; label [8.12, 16.9, 47.39]
+realized/label F158 SNR: median 0.680
+per-galaxy roll sigma_bkg max/min: 1.0000
+  jitter.dz: std 0.0285 (per unique galaxy 0.0285)
+  jitter.dlogm: std 0.1003 (per unique galaxy 0.1003)
+  jitter.dlog_f_line: std 0.0983 (per unique galaxy 0.0983)
+  jitter.dlog_ew: std 0.0980 (per unique galaxy 0.0980)
+  jitter.dlog_size: std 0.0989 (per unique galaxy 0.0989)
+  jitter.dlog_band_flux: std 0.1024 (per unique galaxy 0.1024)

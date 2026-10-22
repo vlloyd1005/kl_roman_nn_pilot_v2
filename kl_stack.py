@@ -139,8 +139,10 @@ def main():
         for f in folds:
             tr, te = folds0 != f, folds0 == f
             A = X[tr]
-            w = np.linalg.solve(A.T @ A + args.ridge * tr.sum() * np.eye(A.shape[1]),
-                                A.T @ lab[tr, k])
+            # lstsq rather than solve: identical or collinear inputs (e.g. the
+            # same run passed twice) give a minimum-norm split, not a crash
+            G = A.T @ A + args.ridge * tr.sum() * np.eye(A.shape[1])
+            w = np.linalg.lstsq(G, A.T @ lab[tr, k], rcond=1e-10)[0]
             stack[te, k] = X[te] @ w
             weights.append({"component": COMP[k][1], "fold": f,
                             **{nm: w[j] for j, nm in enumerate(names)}})
@@ -198,6 +200,16 @@ def main():
     plt.tight_layout()
     fig.savefig(out / "binned_response_stack.png", dpi=140, bbox_inches="tight")
     plt.close(fig)
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from kl_plot_ensemble import plot_ensemble_pred_vs_true
+        print("\nStack predicted vs true:")
+        plot_ensemble_pred_vs_true(stack, lab, out / "pred_vs_true_stack.png",
+                                   f"stack of {', '.join(names)} (cross-fitted)",
+                                   groups=groups)
+    except ImportError:
+        print("(put kl_plot_ensemble.py next to kl_stack.py for pred_vs_true_stack.png)")
     print(f"\nSaved stack_predictions.csv, stack_summary.csv, stack_weights.csv and "
           f"binned_response_stack.png in {out.resolve()}")
 

@@ -1578,7 +1578,11 @@ def parse_args():
     p.add_argument("--meta", default=None, help="meta_pilot_v2_all.json")
     p.add_argument("--outdir", default="./kl_grism_v3")
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=64,
+                   help="Training batch size (larger = faster epochs; consider "
+                        "raising --lr in proportion)")
+    p.add_argument("--eval_batch_size", type=int, default=512,
+                   help="Batch size for validation/test passes (no gradients)")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--patience", type=int, default=30,
@@ -1586,6 +1590,18 @@ def parse_args():
                         "for this many epochs (counted after any noise ramp)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--train_frac", type=float, default=0.70)
+    p.add_argument("--resume", action=B, default=True,
+                   help="k-fold: skip folds whose outputs already exist in "
+                        "--outdir, so an interrupted run continues")
+    p.add_argument("--min_cosi", type=float, default=0.17,
+                   help="Train only on galaxies with truth.cosi above this "
+                        "(drops near edge-on disks); 0 = no cut")
+    p.add_argument("--cosi_cut_all", action=B, default=False,
+                   help="Apply --min_cosi to val and test too (default: "
+                        "training only, so the test sample stays representative)")
+    p.add_argument("--train_subsample", type=float, default=1.0,
+                   help="Train on this fraction of the training galaxies "
+                        "(learning curves); val/test unchanged")
     p.add_argument("--val_frac", type=float, default=0.15)
     p.add_argument("--kfold", type=int, default=0,
                    help="K-fold cross-validation over catalog galaxies "
@@ -1784,6 +1800,29 @@ def run_once(args):
     else:
         tr, va, te = split_by_group(groups, args.train_frac, args.val_frac,
                                     args.seed)
+    if args.train_subsample < 1.0:
+        # learning-curve runs: keep a random fraction of the training galaxies
+        # (whole pop.id groups); val and test are untouched
+        ug = np.unique(groups[tr])
+        pick = np.random.default_rng(args.seed + 1).permutation(ug)[
+            :max(10, int(round(args.train_subsample * len(ug))))]
+        tr = tr[np.isin(groups[tr], pick)]
+        print(f"--train_subsample {args.train_subsample}: training on "
+              f"{len(pick)}/{len(ug)} training galaxies")
+    if args.min_cosi > 0:
+        if "truth.cosi" not in df.columns:
+            raise ValueError("--min_cosi needs the truth.cosi column")
+        ci = df["truth.cosi"].to_numpy()
+        n0 = len(tr)
+        tr = tr[ci[tr] > args.min_cosi]
+        msg = f"cos i > {args.min_cosi}: training keeps {len(tr)}/{n0}"
+        if args.cosi_cut_all:
+            nv, nt = len(va), len(te)
+            va, te = va[ci[va] > args.min_cosi], te[ci[te] > args.min_cosi]
+            msg += f", val {len(va)}/{nv}, test {len(te)}/{nt}"
+        else:
+            msg += " (val/test uncut; add --cosi_cut_all to cut them too)"
+        print(msg)
     print(f"Split sizes — train: {len(tr)}  val: {len(va)}  test: {len(te)}")
     print(f"Unique galaxies — train: {len(np.unique(groups[tr]))}  "
           f"val: {len(np.unique(groups[va]))}  test: {len(np.unique(groups[te]))}")
@@ -1933,7 +1972,7 @@ def run_once(args):
                              args.batch_size, training=True, ema=ema, **ep_kw)
             eval_state = ema.state_dict() if ema is not None else copy_state(model)
             r_va = evaluate_state(model, eval_state, data, va, prep, criterion,
-                                  args.batch_size, parity)
+                                  args.eval_batch_size, parity)
             scheduler.step()
 
             score = selection_scores(r_va["preds"], r_va["labels"], args.select)
@@ -2002,11 +2041,11 @@ def run_once(args):
         # ── Predictions: g+ from its best weights, g× from its own ──────────
         def predict(idx, tta):
             r0 = evaluate_state(model, best_state[0], data, idx, prep, criterion,
-                                args.batch_size, parity, tta=tta)
+                                args.eval_batch_size, parity, tta=tta)
             if best_state[1] is best_state[0]:
                 return r0["preds"], r0["labels"], r0, r0["time"]
             r1 = evaluate_state(model, best_state[1], data, idx, prep, criterion,
-                                args.batch_size, parity, tta=tta)
+                                args.eval_batch_size, parity, tta=tta)
             p = np.stack([r0["preds"][:, 0], r1["preds"][:, 1]], axis=1)
             return p, r0["labels"], r0, r0["time"] + r1["time"]
 
@@ -2094,7 +2133,7 @@ def run_once(args):
         "val_r_g1": cal_info[0, 0], "val_r_g2": cal_info[1, 0],
         "cal_a_g1": cal[0, 0], "cal_b_g1": cal[0, 1],
         "cal_a_g2": cal[1, 0], "cal_b_g2": cal[1, 1],
-        "snr_col": args.snr_col, "min_line_snr": float(args.min_line_snr),
+        "snr_col": args.snr_col, "min_line_snr": float(args.min_line_snr), "train_subsample": float(args.train_subsample), "min_cosi": float(args.min_cosi), "cosi_cut_all": bool(args.cosi_cut_all),
         "noise_scale": float(prep.noise_scale), "roll_sign": roll_sign,
         "canonicalize": prep.canonicalize, "parity": parity,
         "vel_channels": prep.vel_channels, "cont_sub": prep.cont_sub, "cont_profile": prep.cont_profile,
@@ -2173,7 +2212,11 @@ def main():
             a.fold = f
             a.outdir = str(Path(args.outdir) / f"fold{f}")
             print("\n" + "═" * 79 + f"\nFOLD {f + 1} / {args.kfold}\n" + "═" * 79)
-            run_once(a)
+            done = Path(a.outdir) / "test_summary.csv"      # written last by run_once
+            if args.resume and done.exists():
+                print(f"Already finished ({done}); skipping.  Use --no-resume to redo.")
+            else:
+                run_once(a)
             fold_dirs.append(Path(a.outdir))
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
