@@ -334,6 +334,193 @@ def centroid2d(img: torch.Tensor, sigma: float = 3.0, iters: int = 4,
     return c
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PSF-corrected parametric fit to the imaging (--imgfit)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ROMAN_BANDS = {"bb_F129": ("J129", 1293.6), "bb_F158": ("H158", 1579.1)}   # nm
+
+
+def build_imaging_psfs(kind="roman", oversample=3, fwhm_px=None, size=63,
+                       pixel_scale=0.11):
+    """(2, size, size) PSF kernels for F129 and F158 on the oversampled grid,
+    each normalised to unit sum.  'roman': galsim.roman.getPSF at SCA 10,
+    pupil_bin 4, monochromatic at the band's effective wavelength (the setup
+    kl_roman_pipe documents for these mocks); 'gaussian': FWHM fwhm_px coarse
+    pixels, or the diffraction FWHM 1.22 lambda / D per band if None."""
+    out = []
+    if kind == "roman":
+        try:
+            import galsim
+            import galsim.roman
+        except ImportError:
+            print("[WARN] --imgfit_psf roman needs galsim (pip install galsim); "
+                  "using a Gaussian diffraction-limit PSF instead")
+            kind = "gaussian"
+    for ch in IMG_CH:
+        band, lam = ROMAN_BANDS[ch]
+        if kind == "roman":
+            psf = galsim.roman.getPSF(10, band, pupil_bin=4, wavelength=lam)
+            k = psf.drawImage(nx=size, ny=size, scale=pixel_scale / oversample,
+                              method="no_pixel").array.astype(np.float64)
+        else:
+            fw = fwhm_px if fwhm_px else (1.22 * lam * 1e-9 / 2.36 * 206265 / pixel_scale)
+            sig = fw / 2.3548 * oversample
+            r = np.arange(size) - (size - 1) / 2
+            k = np.exp(-(r[None] ** 2 + r[:, None] ** 2) / (2 * sig ** 2))
+        out.append(k / k.sum())
+    return np.stack(out).astype(np.float32), kind
+
+
+def fit_imaging_profiles(img, var, psfs, device, oversample=3, steps=300,
+                         batch=1024, lr=0.05, verbose=True):
+    """Fit an elliptical exponential disk, convolved with each band's PSF and
+    integrated over pixels, to both imaging bands of every galaxy.
+
+    img, var: (N, 2, H, W) noise-normalised stamps and their variances.
+    Shared across bands: centre, scale length R, ellipticity (chi1, chi2);
+    per band: total flux.  Batched Adam on the chi^2.  Returns a dict of
+    (N,) arrays: q (minor/major axis ratio of the model before the PSF),
+    R (scale length, coarse px), F129 / F158 (total flux in noise units),
+    chi2nu, chi1 / chi2 (sky frame)."""
+    N, _, H, W = img.shape
+    os_ = int(oversample)
+    nf_y, nf_x = H * os_, W * os_
+    xf = (torch.arange(nf_x, device=device, dtype=torch.float32) + 0.5) / os_ - W / 2
+    yf = (torch.arange(nf_y, device=device, dtype=torch.float32) + 0.5) / os_ - H / 2
+    YF, XF = torch.meshgrid(yf, xf, indexing="ij")
+    K = psfs.shape[-1]
+    Ly, Lx = nf_y + K - 1, nf_x + K - 1
+    kpad = torch.zeros(2, Ly, Lx, device=device)
+    kpad[:, :K, :K] = torch.as_tensor(psfs, device=device)
+    kft = torch.fft.rfft2(kpad)
+    c0 = K // 2
+    xc = torch.arange(W, device=device, dtype=torch.float32) - (W - 1) / 2
+    yc = torch.arange(H, device=device, dtype=torch.float32) - (H - 1) / 2
+    YC, XC = torch.meshgrid(yc, xc, indexing="ij")
+
+    def render(x0, y0, logR, u1, u2, logF):
+        u = torch.sqrt(u1 ** 2 + u2 ** 2 + 1e-12)
+        chi = torch.tanh(u)
+        q = torch.sqrt((1 - chi) / (1 + chi))
+        pa = 0.5 * torch.atan2(u2, u1)
+        R = torch.exp(logR)
+        dx, dy = XF[None] - x0[:, None, None], YF[None] - y0[:, None, None]
+        c, s = torch.cos(pa)[:, None, None], torch.sin(pa)[:, None, None]
+        xp, yp = c * dx + s * dy, -s * dx + c * dy
+        r = torch.sqrt(xp ** 2 + (yp / q[:, None, None]) ** 2 + 1e-6)
+        prof = torch.exp(-r / R[:, None, None]) / (2 * np.pi * (R ** 2 * q)[:, None, None]) / os_ ** 2
+        pad = torch.zeros(prof.shape[0], 2, Ly, Lx, device=device)
+        pad[:, :, :nf_y, :nf_x] = prof[:, None] * torch.exp(logF)[:, :, None, None]
+        conv = torch.fft.irfft2(torch.fft.rfft2(pad) * kft[None], s=(Ly, Lx))
+        conv = conv[:, :, c0:c0 + nf_y, c0:c0 + nf_x]
+        return conv.reshape(-1, 2, H, os_, W, os_).sum((3, 5))
+
+    out = {k: np.zeros(N, np.float32) for k in
+           ["q", "R", "F129", "F158", "chi2nu", "chi1", "chi2"]}
+    t0 = time.time()
+    for s0 in range(0, N, batch):
+        d = torch.as_tensor(img[s0:s0 + batch], device=device, dtype=torch.float32)
+        v = torch.as_tensor(var[s0:s0 + batch], device=device,
+                            dtype=torch.float32).clamp_min(1e-6)
+        B = d.shape[0]
+        with torch.no_grad():                       # moment-based starting point
+            tot = d.sum(1)
+            cxy = centroid2d(tot)
+            w = torch.exp(-((XC[None] - cxy[:, 0, None, None]) ** 2
+                            + (YC[None] - cxy[:, 1, None, None]) ** 2) / (2 * 4.0 ** 2))
+            g = (tot.clamp_min(0) * w)
+            gs = g.sum((-2, -1)).clamp_min(1e-6)
+            dx = XC[None] - cxy[:, 0, None, None]
+            dy = YC[None] - cxy[:, 1, None, None]
+            qxx = (g * dx * dx).sum((-2, -1)) / gs
+            qyy = (g * dy * dy).sum((-2, -1)) / gs
+            qxy = (g * dx * dy).sum((-2, -1)) / gs
+            T = (qxx + qyy).clamp_min(0.3)
+            ch1, ch2 = (qxx - qyy) / T, 2 * qxy / T
+            chim = torch.sqrt(ch1 ** 2 + ch2 ** 2).clamp(1e-4, 0.85)
+            um = torch.atanh(chim)
+            F0 = d.clamp_min(0).sum((-2, -1)).clamp_min(1.0)
+        P = [cxy[:, 0].clone(), cxy[:, 1].clone(),
+             torch.log((T / 6).sqrt().clamp(0.4, 8.0)),
+             um * ch1 / chim, um * ch2 / chim, torch.log(F0)]
+        P = [p.detach().requires_grad_(True) for p in P]
+        opt = torch.optim.Adam(P, lr=lr)
+        for it in range(steps):
+            opt.zero_grad(set_to_none=True)
+            m = render(*P)
+            chi2 = ((d - m) ** 2 / v).sum((1, 2, 3))
+            chi2.sum().backward()
+            opt.step()
+            with torch.no_grad():
+                P[2].clamp_(np.log(0.2), np.log(12.0))
+                P[0].clamp_(-W / 2 + 2, W / 2 - 2)
+                P[1].clamp_(-H / 2 + 2, H / 2 - 2)
+        with torch.no_grad():
+            m = render(*P)
+            chi2 = ((d - m) ** 2 / v).sum((1, 2, 3)) / (2 * H * W - 7)
+            u = torch.sqrt(P[3] ** 2 + P[4] ** 2 + 1e-12)
+            chi = torch.tanh(u)
+            sl = slice(s0, s0 + B)
+            out["q"][sl] = torch.sqrt((1 - chi) / (1 + chi)).cpu().numpy()
+            out["R"][sl] = torch.exp(P[2]).cpu().numpy()
+            out["F129"][sl] = torch.exp(P[5][:, 0]).cpu().numpy()
+            out["F158"][sl] = torch.exp(P[5][:, 1]).cpu().numpy()
+            out["chi2nu"][sl] = chi2.cpu().numpy()
+            out["chi1"][sl] = (chi * P[3] / u).cpu().numpy()
+            out["chi2"][sl] = (chi * P[4] / u).cpu().numpy()
+        if verbose:
+            print(f"    imaging fit: {min(s0 + B, N)}/{N} galaxies "
+                  f"({time.time() - t0:.0f}s)", flush=True)
+    return out
+
+
+def imaging_fit_features(args, df, noisy, var, sigma, device):
+    """Run (or load from cache) the imaging fit for the rows in df and return
+    parity-even per-galaxy features as [(name, values)]."""
+    psfs, kind = build_imaging_psfs(args.imgfit_psf, args.imgfit_os, args.imgfit_fwhm_px)
+    tag = f"{kind}_os{args.imgfit_os}_s{args.imgfit_steps}"
+    cache = None
+    if args.imgfit_cache != "none":
+        cache = Path(args.imgfit_cache or f"{args.parquet}.imgfit_{tag}.npz")
+    rows = df["src_row"].to_numpy()
+    store = {}
+    if cache is not None and cache.exists():
+        z = np.load(cache)
+        store = {k: z[k] for k in z.files}
+    have = (np.isin(rows, store["src_row"]) if store else np.zeros(len(rows), bool))
+    if not have.all():
+        todo = np.where(~have)[0]
+        print(f"Imaging fit ({kind} PSF, oversample {args.imgfit_os}, "
+              f"{args.imgfit_steps} steps) for {len(todo)} galaxies"
+              + (f"; {have.sum()} from cache" if have.any() else ""))
+        im = noisy[todo, :2] / sigma[todo, :2, None, None]
+        vv = var[todo, :2] / sigma[todo, :2, None, None] ** 2
+        res = fit_imaging_profiles(im, vv, psfs, device, args.imgfit_os,
+                                   args.imgfit_steps)
+        new = {"src_row": rows[todo], **res}
+        if store:
+            store = {k: np.concatenate([store[k], new[k]]) for k in new}
+        else:
+            store = new
+        if cache is not None:
+            try:
+                np.savez(cache, **store)
+                print(f"  cached in {cache}")
+            except OSError as e:
+                print(f"  [WARN] could not write the cache {cache}: {e}")
+    else:
+        print(f"Imaging fit: all {len(rows)} galaxies from cache {cache}")
+    pos = {r: i for i, r in enumerate(store["src_row"])}
+    ix = np.array([pos[r] for r in rows])
+    g = {k: store[k][ix].astype(np.float64) for k in store}
+    return [("fit_q", g["q"]),
+            ("fit_logR", np.log10(np.clip(g["R"], 1e-3, None))),
+            ("fit_logF129", np.log10(np.clip(g["F129"], 1e-3, None))),
+            ("fit_logF158", np.log10(np.clip(g["F158"], 1e-3, None))),
+            ("fit_log_chi2nu", np.log10(np.clip(g["chi2nu"], 1e-3, None)))]
+
+
 def shift2d(x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     """Sub-pixel shift of every (B, C, H, W) image so that a feature at
     (centre + dx, centre + dy) moves to the centre.  dx, dy are (B, C)."""
@@ -434,6 +621,7 @@ class GPUPreprocessor:
         self.obs_names      = []            # observer-side catalog inputs (scal)
         self.obs_stats      = None          # (mu, sd) per obs column, for un-standardising
         self.tf_idx         = None          # (i_z, i_logv_tf) into scal -> TF features
+        self.fitq_idx       = None          # fit_q column in scal (PSF-corrected axis ratio)
         self.h_over_r       = 0.25          # disk thickness assumed for q -> cos i
         self.grism_mirror   = bool(grism_mirror)
         self.cont_sub       = bool(cont_sub) and align_grism and roll_sign != 0
@@ -453,6 +641,7 @@ class GPUPreprocessor:
         self.vel_clip       = float(vel_clip)
         self.noise_scale    = 1.0
         self.mask           = aperture_mask(npix, device)
+        self.npix, self.device = int(npix), torch.device(device)
         self.xx, self.yy    = pixel_coords(npix, device)
         self.W              = torch.exp(-(self.xx ** 2 + self.yy ** 2)
                                         / (2 * moment_sigma ** 2))
@@ -508,7 +697,7 @@ class GPUPreprocessor:
         # 2. grism, 2-D: put each roll's line image at the stamp centre in both
         #    directions before the continuum fit, so the four rolls register
         #    with each other and with the (centred) imaging after alignment
-        if self.recenter == "2d":
+        if self.recenter in ("2d", "joint"):
             B_ = x.shape[0]
             c = centroid2d(x[:, 2:].reshape(B_ * 4, *x.shape[-2:]),
                            smooth_k=self.smooth_k).reshape(B_, 4, 2)
@@ -528,10 +717,12 @@ class GPUPreprocessor:
                                        .expand(-1, 4), profile=self.cont_profile)
             x = torch.cat([x[:, :2], x[:, 2:] - C], dim=1)
         # 4. line recentring on the continuum-free stamps
-        if self.recenter == "2d":
+        if self.recenter in ("2d", "joint"):
             B_ = x.shape[0]
             c = centroid2d(x[:, 2:].reshape(B_ * 4, *x.shape[-2:]),
                            smooth_k=self.smooth_k).reshape(B_, 4, 2)
+            if self.recenter == "joint":
+                c = self.joint_line_centres(x[:, 2:], c, rolls)
             x = torch.cat([x[:, :2], shift2d(x[:, 2:], c[..., 0], c[..., 1])], 1)
         elif self.recenter != "off":
             off = line_offsets(x[:, 2:], smooth_k=self.smooth_k)
@@ -564,6 +755,52 @@ class GPUPreprocessor:
         a = torch.deg2rad(ang[:, 2:])
         dirs = torch.stack([torch.cos(a), -torch.sin(a)], dim=-1)   # (B, 4, 2)
         return {"img": x[:, :2], "gr": x[:, 2:], "dirs": dirs}
+
+    def _native_rotation_sign(self) -> float:
+        """+1 or -1: the sense in which a sky offset rotates into a grism
+        stamp's native frame, measured once by rotating a blob with the same
+        rotate_batch call the alignment uses (so it cannot disagree with it)."""
+        if getattr(self, "_rot_sign", None) is None:
+            n = self.npix
+            r = torch.arange(n, device=self.device, dtype=torch.float32) - (n - 1) / 2
+            Y, X = torch.meshgrid(r, r, indexing="ij")
+            blob = torch.exp(-((X - 5.0) ** 2 + Y ** 2) / 2.0)[None, None]
+            # sky -> native is the inverse of the native -> sky alignment
+            ang = torch.full((1, 1), -self.roll_sign * 30.0, device=self.device)
+            nat = rotate_batch(blob, ang)
+            c = centroid2d(nat[:, 0])[0]
+            self._rot_sign = 1.0 if float(c[1]) >= 0 else -1.0
+        return self._rot_sign
+
+    def joint_line_centres(self, g: torch.Tensor, c: torch.Tensor,
+                           rolls: torch.Tensor) -> torch.Tensor:
+        """Model-consistent line positions for the four rolls.
+
+        Each roll's line centroid (native frame) is one sky offset o of the
+        Halpha emission, rotated into that roll's frame, plus the systemic
+        velocity v0 shifting it along the dispersion (+columns):
+            c_j = R_j o + (s v0, 0).
+        Three numbers per galaxy fitted by weighted least squares to the
+        eight measured coordinates, instead of eight independent shifts, so
+        centroid noise in one faint roll no longer moves that roll's line
+        image relative to the others.  g: (B, 4, H, W) continuum-free line
+        stamps; c: (B, 4, 2) measured centroids; returns (B, 4, 2)."""
+        B, _, H, W = g.shape
+        sm = conv_same(g.reshape(B * 4, H, W), self.smooth_k).reshape(B, 4, H, W)
+        w = sm.clamp_min(0).sum((-2, -1))
+        w = (w / w.mean(1, keepdim=True).clamp_min(1e-6)).clamp(0.05, 20.0)
+        phi = torch.deg2rad(rolls.to(g.dtype)) * self._native_rotation_sign()
+        cs, sn = torch.cos(phi), torch.sin(phi)                       # (B, 4)
+        A = torch.zeros(B, 4, 2, 3, device=g.device, dtype=g.dtype)
+        A[..., 0, 0], A[..., 0, 1], A[..., 0, 2] = cs, -sn, 1.0       # x (column)
+        A[..., 1, 0], A[..., 1, 1] = sn, cs                           # y (row)
+        A = A.reshape(B, 8, 3)
+        ww = w.repeat_interleave(2, dim=1)[..., None]                 # (B, 8, 1)
+        AtA = (A * ww).transpose(1, 2) @ A
+        AtA = AtA + 1e-3 * torch.eye(3, device=g.device, dtype=g.dtype)
+        Atb = (A * ww).transpose(1, 2) @ c.reshape(B, 8, 1)
+        u = torch.linalg.solve(AtA, Atb)
+        return (A @ u).reshape(B, 4, 2)
 
     @staticmethod
     def flip(state: dict) -> dict:
@@ -800,8 +1037,12 @@ class GPUPreprocessor:
         log_vsini = torch.log10((amp.abs() / s).clamp_min(1.0))
         log_sini = (log_vsini - logv).clamp(-2.0, 0.3)
         sin2 = (10.0 ** (2 * log_sini)).clamp(0, 2.0)
-        e = torch.sqrt(e1 ** 2 + e2 ** 2).clamp(0, 0.98)
-        q = torch.sqrt((1 - e) / (1 + e))
+        if self.fitq_idx is not None:          # PSF-corrected fit, if available
+            i = self.fitq_idx
+            q = (scal[:, i] * sd[i] + mu[i]).clamp(0.05, 1.0)
+        else:
+            e = torch.sqrt(e1 ** 2 + e2 ** 2).clamp(0, 0.98)
+            q = torch.sqrt((1 - e) / (1 + e))
         h2 = self.h_over_r ** 2
         cos2 = ((q ** 2 - h2) / (1 - h2)).clamp(0, 1)
         return torch.stack([log_vsini, log_sini, q, cos2, (1 - sin2) - cos2], 1)
@@ -1517,6 +1758,71 @@ def plot_ensemble_pred_vs_true(preds, labels, out_path, title="", nbins=10, grou
     return out
 
 
+def plot_pred_vs_true_by_bins(preds, labels, values, edges, out_path, title="",
+                              label="cos i", groups=None, nbins=8, nboot=200, seed=0):
+    """Grid of predicted-vs-true panels, one row per bin of `values`."""
+    preds, labels, values = (np.asarray(preds, float), np.asarray(labels, float),
+                             np.asarray(values, float))
+    groups = np.arange(len(labels)) if groups is None else np.asarray(groups)
+    rng = np.random.default_rng(seed)
+    nb = len(edges) - 1
+    fig, axes = plt.subplots(nb, 2, figsize=(11, 3.6 * nb), squeeze=False)
+    tlim = np.quantile(np.abs(labels), 0.995) * 1.1
+    rows = []
+    for b in range(nb):
+        lo, hi = edges[b], edges[b + 1]
+        m = (values > lo) & (values <= hi) if b > 0 else (values >= lo) & (values <= hi)
+        for k, (name, col) in enumerate([("g+", "#2E86AB"), ("g×", "#E84855")]):
+            ax = axes[b, k]
+            t, p = labels[m, k], preds[m, k]
+            if m.sum() < 20:
+                ax.text(0.5, 0.5, f"{m.sum()} galaxies", ha="center", va="center",
+                        transform=ax.transAxes)
+                continue
+            r = np.corrcoef(t, p)[0, 1] if np.std(p) > 0 else 0.0
+            g = groups[m]
+            ug = np.unique(g)
+            idx = {u: np.where(g == u)[0] for u in ug}
+            boots = []
+            for _ in range(nboot):
+                ix = np.concatenate([idx[u] for u in rng.choice(ug, len(ug))])
+                if np.std(p[ix]) > 0:
+                    boots.append(np.corrcoef(t[ix], p[ix])[0, 1])
+            r_err = float(np.std(boots)) if boots else np.nan
+            sig = t.std() * np.sqrt(1 / r ** 2 - 1) if r > 0 else np.inf
+            sl, ic = np.polyfit(t, p, 1)
+            plim = np.quantile(np.abs(preds[:, k]), 0.995) * 1.15
+            ax.scatter(t, p, s=4, alpha=0.3, color=col, linewidths=0, rasterized=True)
+            e = np.quantile(t, np.linspace(0, 1, nbins + 1))
+            w = np.clip(np.searchsorted(e, t, side="right") - 1, 0, nbins - 1)
+            bc = [t[w == j].mean() for j in range(nbins) if (w == j).sum() >= 5]
+            bm = [p[w == j].mean() for j in range(nbins) if (w == j).sum() >= 5]
+            be = [p[w == j].std() / np.sqrt((w == j).sum()) for j in range(nbins)
+                  if (w == j).sum() >= 5]
+            ax.errorbar(bc, bm, yerr=be, fmt="o", color=col, ms=4, capsize=2,
+                        label="binned mean")
+            xs = np.array([-tlim, tlim])
+            ax.plot(xs, ic + sl * xs, color=col, lw=1.4, label=f"slope {sl:.3f}")
+            ax.plot(xs, xs, "k--", lw=0.8, label="1:1")
+            ax.set_xlim(-tlim, tlim); ax.set_ylim(-plim, plim)
+            ax.set_title(f"{name}, {label} {lo:g}–{hi:g}:  N={m.sum()}  "
+                         f"r={r:+.3f}±{r_err:.3f}  σ_eff={sig:.3f}", fontsize=10)
+            ax.set_xlabel(f"{name} true"); ax.set_ylabel(f"{name} predicted")
+            ax.grid(alpha=0.25); ax.legend(fontsize=7, loc="upper left")
+            rows.append(dict(bin_lo=lo, bin_hi=hi, component=name, n=int(m.sum()),
+                             r=r, r_err=r_err, sigma_eff=sig, slope=sl, intercept=ic))
+    fig.suptitle(title, fontsize=12)
+    plt.tight_layout()
+    fig.savefig(str(out_path), dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {Path(out_path).name}")
+    for d in rows:
+        print(f"    {d['component']} {label} {d['bin_lo']:g}-{d['bin_hi']:g}: n={d['n']:5d}  "
+              f"r={d['r']:+.3f}±{d['r_err']:.3f}  sigma_eff={d['sigma_eff']:.3f}  "
+              f"slope={d['slope']:.3f}")
+    return rows
+
+
 def plot_binned_rmse(preds, labels, df_split, split_name, out_dir: Path, nbins=6):
     """RMSE of g+ and g× in quantile bins of S/N and inclination."""
     specs = [(c, l) for c, l in [("snr_eff.line_total", "realised line S/N"),
@@ -1878,7 +2184,7 @@ def parse_args():
     p.add_argument("--recenter_imaging", action=B, default=True,
                    help="Shift each imaging stamp so the galaxy's light "
                         "centroid is at the centre before measuring shapes")
-    p.add_argument("--recenter_line", choices=["off", "common", "per_roll", "2d"],
+    p.add_argument("--recenter_line", choices=["off", "common", "per_roll", "2d", "joint"],
                    default="2d",
                    help="Re-register the grism line images: 2d = shift each "
                         "roll's line centroid to the stamp centre in both "
@@ -1907,6 +2213,19 @@ def parse_args():
                    help="Add Tully-Fisher inclination features (v sin i in "
                         "km/s, sin i from the TF speed, cos i from the axis "
                         "ratio, and their mismatch)")
+    p.add_argument("--imgfit", action=B, default=True,
+                   help="Fit a PSF-convolved elliptical exponential disk to the "
+                        "imaging and feed its axis ratio, size, fluxes and fit "
+                        "quality as inputs (cached next to the parquet)")
+    p.add_argument("--imgfit_psf", choices=["roman", "gaussian"], default="roman",
+                   help="roman = galsim.roman.getPSF (SCA 10, pupil_bin 4, needs "
+                        "pip install galsim); gaussian = --imgfit_fwhm_px")
+    p.add_argument("--imgfit_fwhm_px", type=float, default=None,
+                   help="Gaussian PSF FWHM in pixels (default: 1.22 lambda/D per band)")
+    p.add_argument("--imgfit_os", type=int, default=3, help="render oversampling")
+    p.add_argument("--imgfit_steps", type=int, default=300, help="Adam steps per batch")
+    p.add_argument("--imgfit_cache", default=None,
+                   help="cache file (default <parquet>.imgfit_<settings>.npz; 'none' = off)")
     p.add_argument("--tf_h_over_r", type=float, default=0.25,
                    help="Disk thickness used to turn axis ratio into cos i")
     p.add_argument("--drop_stream", choices=["none", "grism", "imaging"],
@@ -2022,6 +2341,8 @@ def run_once(args):
         missing = [c for c, _, _ in OBS_COLUMNS if c not in df.columns]
         print(f"Observer-side inputs (--obs_inputs): {[n for n, _ in cols]}"
               + (f"   not in parquet: {missing}" if missing else ""))
+    if args.imgfit:
+        cols += imaging_fit_features(args, df, noisy, var, sigma, device)
     if cols:
         obs_names = [n for n, _ in cols]
         V = np.column_stack([v for _, v in cols])
@@ -2096,6 +2417,8 @@ def run_once(args):
               and prep.kin_cal is not None)
         if ok:
             prep.tf_idx = (obs_names.index("z"), obs_names.index("log_vcirc_tf"))
+            if "fit_q" in obs_names:
+                prep.fitq_idx = obs_names.index("fit_q")
             print(f"Tully-Fisher features: {prep.TF_NAMES} (disk h/r "
                   f"{prep.h_over_r})")
         else:
@@ -2316,6 +2639,11 @@ def run_once(args):
         if not name.endswith("_raw"):
             plot_binned_rmse(preds, labels, df.iloc[ix].reset_index(drop=True),
                              name, out_dir)
+    if "truth.cosi" in df.columns:
+        plot_pred_vs_true_by_bins(
+            te_preds_raw, te_labels, df["truth.cosi"].to_numpy()[te], [0, 0.3, 0.7, 1.0],
+            out_dir / "pred_vs_true_test_by_cosi.png", f"{out_dir.name}: test, raw",
+            groups=df["pop.id"].to_numpy()[te] if "pop.id" in df.columns else None)
 
     keep = [c for c in ["src_row", "pop.id", "db_seed", "truth.z", "truth.cosi",
                         "truth.vel.vcirc", "snr_eff.line_total", "snr_eff.F158"]
@@ -2352,7 +2680,7 @@ def run_once(args):
         "canonicalize": prep.canonicalize, "parity": parity,
         "vel_channels": prep.vel_channels, "cont_sub": prep.cont_sub, "cont_profile": prep.cont_profile,
         "angle_inputs": prep.angle_inputs, "kin_scalars": prep.kin_scalars,
-        "feat_scalars": prep.feat_norm is not None, "obs_inputs": ",".join(prep.obs_names), "tf_features": prep.tf_idx is not None,
+        "feat_scalars": prep.feat_norm is not None, "obs_inputs": ",".join(prep.obs_names), "imgfit": bool(args.imgfit), "tf_features": prep.tf_idx is not None,
         "kin_calibrate": prep.kin_cal is not None,
         "recenter_line": prep.recenter,
         "recenter_imaging": prep.recenter_imaging, "grism_mirror": prep.grism_mirror,
@@ -2402,6 +2730,12 @@ def aggregate_kfold(args, fold_dirs):
         pr[m] = (pr[m] - pr[m].mean(0)) / (pr[m].std(0) + 1e-12) * lab.std(0)
     plot_binned_response(pr, lab, out / "binned_response_oof.png",
                          "out-of-fold, raw, per-fold standardised")
+    if "truth.cosi" in oof.columns:
+        print("\n  Pooled out-of-fold predicted vs true by cos i:")
+        plot_pred_vs_true_by_bins(pr, lab, oof["truth.cosi"].to_numpy(), [0, 0.3, 0.7, 1.0],
+                                  out / "pred_vs_true_oof_by_cosi.png",
+                                  f"{out.name}: out-of-fold, raw, per-fold standardised",
+                                  groups=groups)
     print("\n  Pooled out-of-fold predicted vs true:")
     plot_ensemble_pred_vs_true(pr, lab, out / "pred_vs_true_oof_raw.png",
                                f"{out.name}: out-of-fold, raw, per-fold standardised",
