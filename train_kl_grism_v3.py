@@ -85,6 +85,17 @@ CHANNELS      = IMG_CH + GRISM_CH
 TARGETS       = ["truth.g_plus", "truth.g_cross"]
 DEFAULT_ROLLS = [0.0, 10.0, 167.0, 177.0]
 G_SCALE       = 0.03   # width of the shear prior; networks predict g / G_SCALE
+# Observer-side catalog columns usable as inputs: (column, input name, log10?).
+# These are the noisy simulated measurements that centre the analytic fit's
+# priors (kl_pipe.ensemble.population); the true values (pop.logm,
+# pop.vcirc_kms, ...) would leak the answer and are never read.
+OBS_COLUMNS = [
+    ("pop.prior_vcirc_mu_kms", "log_vcirc_tf", True),
+    ("pop.logm_obs", "logm_obs", False),
+    ("pop.f_line_obs_cgs", "log_fline_obs", True),
+    ("pop.flux_obs_f129_ujy", "log_f129_obs", True),
+    ("pop.flux_obs_f158_ujy", "log_f158_obs", True),
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -420,6 +431,10 @@ class GPUPreprocessor:
         self.kin_scalars    = bool(kin_scalars) and align_grism
         self.kin_cal        = None          # set by fit_kin_calibration()
         self.feat_norm      = None          # (mu, sd) when features feed the CNN
+        self.obs_names      = []            # observer-side catalog inputs (scal)
+        self.obs_stats      = None          # (mu, sd) per obs column, for un-standardising
+        self.tf_idx         = None          # (i_z, i_logv_tf) into scal -> TF features
+        self.h_over_r       = 0.25          # disk thickness assumed for q -> cos i
         self.grism_mirror   = bool(grism_mirror)
         self.cont_sub       = bool(cont_sub) and align_grism and roll_sign != 0
         self.cont_order     = int(cont_order)
@@ -760,6 +775,46 @@ class GPUPreprocessor:
         v = u_al[:, None] * d + u_ac[:, None] * e
         return v[:, 0], v[:, 1]
 
+    TF_NAMES = ["tf_log_vsini", "tf_log_sini", "tf_q", "tf_cos2i_phot",
+                "tf_incl_mismatch"]
+
+    def tf_features(self, feat: torch.Tensor, scal: torch.Tensor) -> torch.Tensor:
+        """Tully-Fisher inclination features (all even under the mirror flip).
+
+        v sin i in km/s from the calibrated velocity-gradient amplitude
+        (Doppler pixels) and the redshift; sin i from v sin i over the TF
+        rotation speed predicted from the photometric mass
+        (pop.prior_vcirc_mu_kms, the centre of the analytic fit's vcirc
+        prior); cos^2 i from the image axis ratio for a disk of thickness h,
+        q^2 = cos^2 i + h^2 sin^2 i; and the mismatch between the two
+        inclinations, which is where a shear along the major axis (g+) shows
+        up."""
+        names = self.feature_names()
+        amp = feat[:, names.index("cal_kin_amp")]
+        e1, e2 = feat[:, names.index("img_e1")], feat[:, names.index("img_e2")]
+        mu, sd = self.obs_stats
+        iz, iv = self.tf_idx
+        z = scal[:, iz] * sd[iz] + mu[iz]
+        logv = scal[:, iv] * sd[iv] + mu[iv]                 # log10 km/s
+        s = 656.28 * (1 + z) / (2.99792458e5 * 1.1)          # px per km/s
+        log_vsini = torch.log10((amp.abs() / s).clamp_min(1.0))
+        log_sini = (log_vsini - logv).clamp(-2.0, 0.3)
+        sin2 = (10.0 ** (2 * log_sini)).clamp(0, 2.0)
+        e = torch.sqrt(e1 ** 2 + e2 ** 2).clamp(0, 0.98)
+        q = torch.sqrt((1 - e) / (1 + e))
+        h2 = self.h_over_r ** 2
+        cos2 = ((q ** 2 - h2) / (1 - h2)).clamp(0, 1)
+        return torch.stack([log_vsini, log_sini, q, cos2, (1 - sin2) - cos2], 1)
+
+    def all_feature_names(self):
+        return self.feature_names() + (self.TF_NAMES if self.tf_idx is not None else [])
+
+    def all_features(self, state: dict, scal=None) -> torch.Tensor:
+        f = self.features(state)
+        if self.tf_idx is not None and scal is not None:
+            f = torch.cat([f, self.tf_features(f, scal)], 1)
+        return f
+
     def feature_names(self):
         names = ["flux_F129", "flux_F158", "img_e1", "img_e2", "img_T"]
         for i, j in self.pairs:
@@ -1073,7 +1128,7 @@ def model_forward(model, prep, state, scal, parity: bool):
         extra = []
         if prep.feat_norm is not None:
             mu, sd = prep.feat_norm
-            f = ((prep.features(st) - mu) / sd).clamp(-5, 5)
+            f = ((prep.all_features(st, scal) - mu) / sd).clamp(-5, 5)
             return f if scal is None else torch.cat([scal, f], 1)
         if prep.angle_inputs:
             extra.append(prep.angle_features(st))
@@ -1353,6 +1408,115 @@ def plot_pred_vs_true(preds, labels, split_name, out_dir: Path, nbins=8):
     print(f"  Saved: {fname.name}")
 
 
+_ENS_COLORS = {"g+": "#2E86AB", "g×": "#E84855"}
+
+
+def _binned(t, p, nbins):
+    edges = np.quantile(t, np.linspace(0, 1, nbins + 1))
+    which = np.clip(np.searchsorted(edges, t, side="right") - 1, 0, nbins - 1)
+    bc, bm, be = [], [], []
+    for k in range(nbins):
+        s = which == k
+        if s.sum() >= 5:
+            bc.append(t[s].mean()); bm.append(p[s].mean())
+            be.append(p[s].std() / np.sqrt(s.sum()))
+    return np.array(bc), np.array(bm), np.array(be)
+
+
+def plot_ensemble_pred_vs_true(preds, labels, out_path, title="", nbins=10, groups=None,
+                               nboot=200, seed=0):
+    """Three-panel predicted-vs-true figure per shear component.  Returns a
+    dict of per-component summary numbers."""
+    preds, labels = np.asarray(preds, float), np.asarray(labels, float)
+    n = len(labels)
+    groups = np.arange(n) if groups is None else np.asarray(groups)
+    ug, inv = np.unique(groups, return_inverse=True)
+    members = [np.where(inv == k)[0] for k in range(len(ug))]
+    rng = np.random.default_rng(seed)
+    fig, axes = plt.subplots(2, 3, figsize=(17, 10))
+    out = {}
+    for row, name in enumerate(["g+", "g×"]):
+        t, p = labels[:, row], preds[:, row]
+        col = _ENS_COLORS[name]
+        sl, ic = np.polyfit(t, p, 1)
+        r = np.corrcoef(t, p)[0, 1] if np.std(p) > 0 else 0.0
+        boots = []
+        for _ in range(nboot):
+            ix = np.concatenate([members[k] for k in rng.integers(0, len(ug), len(ug))])
+            if np.std(p[ix]) > 0:
+                boots.append(np.corrcoef(t[ix], p[ix])[0, 1])
+        r_err = float(np.std(boots)) if boots else np.nan
+        tlim = np.quantile(np.abs(t), 0.995) * 1.1
+
+        # 1. raw
+        ax = axes[row, 0]
+        plim = np.quantile(np.abs(p), 0.995) * 1.15
+        ax.hexbin(t, p, gridsize=45, cmap="Greys", mincnt=1,
+                  extent=(-tlim, tlim, -plim, plim), bins="log")
+        bc, bm, be = _binned(t, p, nbins)
+        ax.errorbar(bc, bm, yerr=be, fmt="o", color=col, ms=5, capsize=2,
+                    label="binned mean")
+        xs = np.array([-tlim, tlim])
+        ax.plot(xs, ic + sl * xs, color=col, lw=1.5, label=f"fit slope {sl:.3f}")
+        ax.plot(xs, xs, "k--", lw=0.8, label="1:1")
+        ax.set_xlim(-tlim, tlim); ax.set_ylim(-plim, plim)
+        ax.set_xlabel(f"{name} true"); ax.set_ylabel(f"{name} predicted (raw)")
+        ax.set_title(f"{name} raw:  r = {r:+.3f} ± {r_err:.3f}  ({r / r_err:.1f}σ)"
+                     if r_err > 0 else f"{name} raw:  r = {r:+.3f}")
+
+        # 2. response-corrected
+        ax = axes[row, 1]
+        if sl > 0 and r_err > 0 and r / r_err > 2:
+            pc = (p - ic) / sl
+            clim = np.quantile(np.abs(pc), 0.98) * 1.1
+            ax.hexbin(t, pc, gridsize=45, cmap="Greys", mincnt=1,
+                      extent=(-tlim, tlim, -clim, clim), bins="log")
+            bc, bm, be = _binned(t, pc, nbins)
+            ax.errorbar(bc, bm, yerr=be, fmt="o", color=col, ms=5, capsize=2,
+                        label="binned mean")
+            ax.plot(xs, xs, "k--", lw=1, label="1:1")
+            ax.set_ylim(-clim, clim)
+            ax.set_title(f"{name} response-corrected: (pred − c) / {sl:.3f}")
+            err = pc - t
+            sig_eff = float(np.std(err))
+        else:
+            pc, err, sig_eff = None, None, np.nan
+            ax.text(0.5, 0.5, "no significant positive response:\nnothing to correct",
+                    ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(f"{name} response-corrected")
+        ax.set_xlim(-tlim, tlim)
+        ax.set_xlabel(f"{name} true"); ax.set_ylabel(f"{name} estimate")
+
+        # 3. error distribution
+        ax = axes[row, 2]
+        if err is not None:
+            lim = np.quantile(np.abs(err), 0.99)
+            bins = np.linspace(-lim, lim, 60)
+            ax.hist(err, bins=bins, density=True, color=col, alpha=0.6,
+                    label=f"estimate − true, σ_eff = {sig_eff:.3f}")
+            ax.hist(t, bins=bins, density=True, histtype="step", color="k",
+                    label=f"true shear, σ = {np.std(t):.3f}")
+            ax.set_xlabel("shear"); ax.set_ylabel("density")
+            ax.set_title(f"{name}: per-galaxy noise σ_eff = {sig_eff:.3f}; "
+                         f"ensemble error σ_eff/√N = {sig_eff / np.sqrt(n):.4f}")
+        else:
+            ax.axis("off")
+        out[name] = dict(n=n, r=r, r_err=r_err, slope=sl, intercept=ic,
+                         sigma_eff=sig_eff, ensemble_err=sig_eff / np.sqrt(n))
+        for a in axes[row]:
+            if a.has_data():
+                a.grid(alpha=0.25); a.legend(fontsize=8, loc="upper left")
+    fig.suptitle(f"{title}   (N = {n})", fontsize=12)
+    plt.tight_layout()
+    fig.savefig(str(out_path), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {Path(out_path).name}")
+    for name, d in out.items():
+        print(f"    {name}: r {d['r']:+.3f} ± {d['r_err']:.3f}  slope {d['slope']:.3f}  "
+              f"sigma_eff {d['sigma_eff']:.3f}  ensemble error {d['ensemble_err']:.4f}")
+    return out
+
+
 def plot_binned_rmse(preds, labels, df_split, split_name, out_dir: Path, nbins=6):
     """RMSE of g+ and g× in quantile bins of S/N and inclination."""
     specs = [(c, l) for c, l in [("snr_eff.line_total", "realised line S/N"),
@@ -1444,7 +1608,7 @@ def collect_features(data, prep, idx, train, bs, alpha=None, flip=False):
         st = prep.prepare(*data.batch(b), train, alpha=alpha)
         if flip:
             st = prep.flip(st)
-        f = prep.features(st)
+        f = prep.all_features(st, data.scal[b] if data.scal is not None else None)
         if data.scal is not None:
             f = torch.cat([f, data.scal[b]], 1)
         out.append(f.cpu())
@@ -1454,7 +1618,7 @@ def collect_features(data, prep, idx, train, bs, alpha=None, flip=False):
 def run_feature_baseline(args, data, prep, tr, va, te, df, y, out_dir):
     from sklearn.ensemble import HistGradientBoostingRegressor
 
-    names = prep.feature_names() + (["z"] if data.scal is not None else [])
+    names = prep.all_feature_names() + (prep.obs_names if data.scal is not None else [])
     print(f"\nFeature baseline with {len(names)} features: {names}")
     if not prep.canonicalize:
         print("[WARN] features are frame-dependent; --canonicalize is strongly "
@@ -1593,7 +1757,7 @@ def parse_args():
     p.add_argument("--resume", action=B, default=True,
                    help="k-fold: skip folds whose outputs already exist in "
                         "--outdir, so an interrupted run continues")
-    p.add_argument("--min_cosi", type=float, default=0.17,
+    p.add_argument("--min_cosi", type=float, default=0.0,
                    help="Train only on galaxies with truth.cosi above this "
                         "(drops near edge-on disks); 0 = no cut")
     p.add_argument("--cosi_cut_all", action=B, default=False,
@@ -1733,7 +1897,18 @@ def parse_args():
     p.add_argument("--dropout2d", type=float, default=0.1,
                    help="Feature-map dropout after fusion")
     p.add_argument("--use_z", action="store_true",
-                   help="Append redshift as a scalar input")
+                   help="Append redshift as a scalar input (implied by --obs_inputs)")
+    p.add_argument("--obs_inputs", action=B, default=True,
+                   help="Feed observer-side catalog measurements as scalar "
+                        "inputs: z, the TF-predicted rotation speed from the "
+                        "noisy photometric mass (pop.prior_vcirc_mu_kms), "
+                        "pop.logm_obs and the noisy flux measurements")
+    p.add_argument("--tf_features", action=B, default=True,
+                   help="Add Tully-Fisher inclination features (v sin i in "
+                        "km/s, sin i from the TF speed, cos i from the axis "
+                        "ratio, and their mismatch)")
+    p.add_argument("--tf_h_over_r", type=float, default=0.25,
+                   help="Disk thickness used to turn axis ratio into cos i")
     p.add_argument("--drop_stream", choices=["none", "grism", "imaging"],
                    default="none", help="Ablation: zero one stream's features")
     # feature baseline
@@ -1829,11 +2004,32 @@ def run_once(args):
     for name, ix in [("train", tr), ("val", va), ("test", te)]:
         df.iloc[ix].to_csv(out_dir / f"split_{name}.csv", index=False)
 
-    scal, z_stats = None, None
-    if args.use_z:
-        z = df["truth.z"].to_numpy(np.float32)
-        z_stats = (float(z[tr].mean()), float(z[tr].std() + 1e-8))
-        scal = ((z - z_stats[0]) / z_stats[1])[:, None].astype(np.float32)
+    scal, z_stats, obs_names = None, None, []
+    cols = []                      # (name, values) of observer-side scalar inputs
+    if args.use_z or args.obs_inputs:
+        cols.append(("z", df["truth.z"].to_numpy(np.float64)))
+    if args.obs_inputs:
+        # Measured quantities only: the analytic fit centres its priors on
+        # these noisy simulated measurements.  Never truth.* (besides z, which
+        # the line position measures) or the true pop.* values.
+        for c, nm, lg in OBS_COLUMNS:
+            if c in df.columns:
+                v = df[c].to_numpy(np.float64)
+                if lg:
+                    v = np.log10(np.clip(v, 1e-30, None))
+                if np.nanstd(v[tr]) > 0:
+                    cols.append((nm, v))
+        missing = [c for c, _, _ in OBS_COLUMNS if c not in df.columns]
+        print(f"Observer-side inputs (--obs_inputs): {[n for n, _ in cols]}"
+              + (f"   not in parquet: {missing}" if missing else ""))
+    if cols:
+        obs_names = [n for n, _ in cols]
+        V = np.column_stack([v for _, v in cols])
+        V = np.where(np.isfinite(V), V, np.nanmedian(V[tr], 0))
+        mu = np.median(V[tr], 0)
+        sd = (np.percentile(V[tr], 84, 0) - np.percentile(V[tr], 16, 0)) / 2 + 1e-8
+        scal = ((V - mu) / sd).astype(np.float32)
+        z_stats = (mu.tolist(), sd.tolist(), obs_names)
 
     # ── Preprocessing ────────────────────────────────────────────────────────
     align = args.align_grism
@@ -1890,6 +2086,22 @@ def run_once(args):
         if w is not None:
             prep.kin_cal = torch.as_tensor(w, device=device)
 
+    prep.obs_names = obs_names
+    if scal is not None:
+        prep.obs_stats = (torch.as_tensor(z_stats[0], dtype=torch.float32, device=device),
+                          torch.as_tensor(z_stats[1], dtype=torch.float32, device=device))
+    prep.h_over_r = args.tf_h_over_r
+    if args.tf_features:
+        ok = (scal is not None and "z" in obs_names and "log_vcirc_tf" in obs_names
+              and prep.kin_cal is not None)
+        if ok:
+            prep.tf_idx = (obs_names.index("z"), obs_names.index("log_vcirc_tf"))
+            print(f"Tully-Fisher features: {prep.TF_NAMES} (disk h/r "
+                  f"{prep.h_over_r})")
+        else:
+            print("[NOTE] --tf_features needs z, pop.prior_vcirc_mu_kms and the "
+                  "kinematic calibration; skipped")
+
     if args.arch != "features" and args.feat_scalars:
         # the hand-built KL measurements (kinematic-photometric misalignment,
         # calibrated velocity gradient, moments, ...) go straight into the
@@ -1899,7 +2111,9 @@ def run_once(args):
             F_tr = []
             for s0 in range(0, len(tr), 512):
                 b = torch.from_numpy(np.asarray(tr[s0:s0 + 512])).to(device)
-                F_tr.append(prep.features(prep.prepare(*data.batch(b), train=False)))
+                F_tr.append(prep.all_features(
+                    prep.prepare(*data.batch(b), train=False),
+                    data.scal[b] if data.scal is not None else None))
             F_tr = torch.cat(F_tr)
         prep.noise_scale = ns0
         mu = F_tr.median(0).values
@@ -1926,7 +2140,7 @@ def run_once(args):
         model = SmallTwoStream(
             n_img=len(IMG_CH), n_grism=prep.n_grism_in,
             n_scalar=(0 if scal is None else scal.shape[1])
-            + (len(prep.feature_names()) if prep.feat_norm is not None else
+            + (len(prep.all_feature_names()) if prep.feat_norm is not None else
                (len(prep.ANGLE_NAMES) if prep.angle_inputs else 0)
                + (2 if prep.kin_scalars else 0)),
             drop_stream=args.drop_stream,
@@ -2138,7 +2352,7 @@ def run_once(args):
         "canonicalize": prep.canonicalize, "parity": parity,
         "vel_channels": prep.vel_channels, "cont_sub": prep.cont_sub, "cont_profile": prep.cont_profile,
         "angle_inputs": prep.angle_inputs, "kin_scalars": prep.kin_scalars,
-        "feat_scalars": prep.feat_norm is not None,
+        "feat_scalars": prep.feat_norm is not None, "obs_inputs": ",".join(prep.obs_names), "tf_features": prep.tf_idx is not None,
         "kin_calibrate": prep.kin_cal is not None,
         "recenter_line": prep.recenter,
         "recenter_imaging": prep.recenter_imaging, "grism_mirror": prep.grism_mirror,
@@ -2188,6 +2402,14 @@ def aggregate_kfold(args, fold_dirs):
         pr[m] = (pr[m] - pr[m].mean(0)) / (pr[m].std(0) + 1e-12) * lab.std(0)
     plot_binned_response(pr, lab, out / "binned_response_oof.png",
                          "out-of-fold, raw, per-fold standardised")
+    print("\n  Pooled out-of-fold predicted vs true:")
+    plot_ensemble_pred_vs_true(pr, lab, out / "pred_vs_true_oof_raw.png",
+                               f"{out.name}: out-of-fold, raw, per-fold standardised",
+                               groups=groups)
+    pc = oof[["g_plus_pred", "g_cross_pred"]].to_numpy()
+    if np.any(pc != 0):
+        plot_ensemble_pred_vs_true(pc, lab, out / "pred_vs_true_oof_calibrated.png",
+                                   f"{out.name}: out-of-fold, calibrated", groups=groups)
     print("\n  Per-fold correlations (raw):")
     for f in sorted(oof["fold"].unique()):
         m = (oof["fold"] == f).to_numpy()
@@ -2195,8 +2417,8 @@ def aggregate_kfold(args, fold_dirs):
              for k, c in enumerate(["g_plus_raw", "g_cross_raw"])]
         print(f"    fold {f}: n={m.sum():5d}  r(g+) {r[0]:+.3f}  r(g×) {r[1]:+.3f}")
     pd.DataFrame(rows).to_csv(out / "kfold_summary.csv", index=False)
-    print(f"\nSaved oof_predictions.csv, kfold_summary.csv and "
-          f"binned_response_oof.png in {out.resolve()}")
+    print(f"\nSaved oof_predictions.csv, kfold_summary.csv, binned_response_oof.png "
+          f"and pred_vs_true_oof_*.png in {out.resolve()}")
 
 
 def main():
