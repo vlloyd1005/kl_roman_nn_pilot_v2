@@ -18,7 +18,8 @@ stamps). The real training rows are mixed in at 15-20% of each batch.
 | previous best, `run04/imgfit_f0_v2` (its own 1,320-row test split) | 0.372 | 0.491 | ~0.145 | ~0.10 |
 | shearnet, real data only (E1) | 0.19 | ~0 | | |
 | shearnet, 60k sims from an imperfect forward model (E3) | 0.385 | 0.510 | 0.116 | 0.060 |
-| **shearnet, 120k sims from the validated forward model (E5, `models/shearnet_E5.pt`)** | **0.416** | **0.580** | **0.098** | **0.046** |
+| shearnet, 120k sims from the validated forward model (E5) | 0.416 | 0.580 | 0.098 | 0.046 |
+| **shearnet ensemble E5 + E6 (E6: 240k sims), released** | **0.420** | **0.590** | **0.097** | **0.044** |
 
 `sigma_eff` is the effective per-galaxy shear noise of the de-shrunk,
 inverse-variance-weighted, validation-calibrated estimator, computed from the
@@ -26,25 +27,26 @@ actual test residuals: N galaxies measure the mean shear to
 `sigma_eff / sqrt(N)`. For comparison, conventional shape-noise weak lensing has
 about 0.26 per component. The earlier models' values are estimated from their r
 (no per-galaxy uncertainty was available). For a fixed shear S/N, this model
-needs about 2.2x (g+) and 4.7x (g×) fewer galaxies than the previous best.
+needs about 2.2x (g+) and 5.2x (g×) fewer galaxies than the previous best.
 
 After calibration on the validation galaxies, the test biases are consistent with zero:
-m(g+) = +0.009 ± 0.037, m(g×) = +0.022 ± 0.016, and |c| < 0.003. The
-predicted per-galaxy sigma is calibrated (pull standard deviation 0.93-1.04).
+m(g+) = +0.014 ± 0.036, m(g×) = +0.025 ± 0.016, and |c| < 0.002 (released
+ensemble). The predicted per-galaxy sigma is calibrated (pull standard deviation 0.91-1.04).
 
 By inclination (test, r):
 
 | cos i | g+ | g× | oracle g+ ceiling |
 |---|---|---|---|
-| 0.05-0.3 (edge-on) | 0.33 | 0.29 | 0.34 |
-| 0.3-0.6 | 0.29 | 0.62 | 0.45 |
-| 0.6-0.95 (face-on) | 0.66 | 0.78 | 0.85 |
+| 0.05-0.3 (edge-on) | 0.33 | 0.31 | 0.34 |
+| 0.3-0.6 | 0.29 | 0.63 | 0.45 |
+| 0.6-0.95 (face-on) | 0.66 | 0.79 | 0.85 |
 
 **What to expect.** g+ is close to its physical limit for edge-on disks. Overall
 it reaches about 75% of the perfect-data ceiling (0.42 vs 0.56). The headroom
 left is mostly in g× for inclined disks and in g+ for face-on disks. Further
-gains are most likely from more simulations (still increasing at 120k) and longer
-training on a GPU. Per-galaxy R^2 cannot approach 1 for g+ on this data set.
+gains from more simulations are flattening: going from 120k to 240k sims improved
+validation MSE by only 0.4%. A larger network trained on a GPU, or a likelihood
+fit with `forward.py` as a benchmark, are the remaining options. Per-galaxy R^2 cannot approach 1 for g+ on this data set.
 Judge the model by sigma_eff and the calibration (m, c), not by R^2.
 
 Experiment log (all evaluated on the same validation/test galaxies):
@@ -59,7 +61,10 @@ Experiment log (all evaluated on the same validation/test galaxies):
   0.373/0.522 and real 0.373/0.544.
 * E4 (60k corrected sims) gives test 0.405 / 0.556. E5 (120k corrected sims, 20% real)
   gives test 0.416 / 0.580. An E4+E5 ensemble is equal on test (0.418 / 0.578) but
-  inherits a small g+ additive bias from E4, so E5 alone is the released model.
+  inherits a small g+ additive bias from E4, so it was not used.
+* E6: E5 fine-tuned on 240k corrected sims (A+B+C+D), validation MSE 0.777 vs 0.780.
+  The E5 + E6 ensemble was best on validation (r 0.381 / 0.564) and is the released
+  model: test 0.420 / 0.590, sigma_eff 0.097 / 0.044.
 
 
 ## Why the earlier models stalled (diagnosis)
@@ -162,13 +167,15 @@ information comes from galaxies with cos i > 0.6, so weighting matters.
 
 ## Released model
 
-`models/shearnet_E5.pt` is a self-contained checkpoint (weights, input
-normalisation, roll angles, noise levels). `models/shearnet_E5_calibration.json`
-holds the validation calibration, and `models/psf_os5.npz` holds the precomputed
+The released model is the ensemble of `models/shearnet_E5.pt` and
+`models/shearnet_E6.pt` (self-contained checkpoints: weights, input
+normalisation, roll angles, noise levels). `models/shearnet_ensemble_calibration.json`
+holds its validation calibration (`shearnet_E5_calibration.json` is for E5 alone), and `models/psf_os5.npz` holds the precomputed
 Roman PSF kernels used by the simulator.
 
 ```bash
-python predict.py --ckpt models/shearnet_E5.pt --calib models/shearnet_E5_calibration.json \
+python predict.py --ckpt models/shearnet_E5.pt models/shearnet_E6.pt \
+    --calib models/shearnet_ensemble_calibration.json \
     --parquet new_galaxies.parquet --out shear_pred.csv
 ```
 
