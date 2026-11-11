@@ -7,9 +7,60 @@ per-galaxy uncertainty** from the six Roman stamps (F129, F158, 4 grism rolls) o
 The design differs from the earlier `train_kl_grism*.py` runs in one main way:
 **most of the training data are simulations from a forward model that was rebuilt
 to reproduce the mock renderer** (validated pixel by pixel against the noiseless
-stamps). The real training rows are mixed in at 15% of each batch.
+stamps). The real training rows are mixed in at 15-20% of each batch.
 
-RESULTS_PLACEHOLDER
+## Results (held-out test set: 2,073 rows of galaxies never seen in training or simulations)
+
+![summary](figs/summary_test.png)
+
+| | r(g+) | r(g×) | sigma_eff g+ | sigma_eff g× |
+|---|---|---|---|---|
+| previous best, `run04/imgfit_f0_v2` (its own 1,320-row test split) | 0.372 | 0.491 | ~0.145 | ~0.10 |
+| shearnet, real data only (E1) | 0.19 | ~0 | | |
+| shearnet, 60k sims from an imperfect forward model (E3) | 0.385 | 0.510 | 0.116 | 0.060 |
+| **shearnet, 120k sims from the validated forward model (E5, `models/shearnet_E5.pt`)** | **0.416** | **0.580** | **0.098** | **0.046** |
+
+`sigma_eff` is the effective per-galaxy shear noise of the de-shrunk,
+inverse-variance-weighted, validation-calibrated estimator, computed from the
+actual test residuals: N galaxies measure the mean shear to
+`sigma_eff / sqrt(N)`. For comparison, conventional shape-noise weak lensing has
+about 0.26 per component. The earlier models' values are estimated from their r
+(no per-galaxy uncertainty was available). For a fixed shear S/N, this model
+needs about 2.2x (g+) and 4.7x (g×) fewer galaxies than the previous best.
+
+After calibration on the validation galaxies, the test biases are consistent with zero:
+m(g+) = +0.009 ± 0.037, m(g×) = +0.022 ± 0.016, and |c| < 0.003. The
+predicted per-galaxy sigma is calibrated (pull standard deviation 0.93-1.04).
+
+By inclination (test, r):
+
+| cos i | g+ | g× | oracle g+ ceiling |
+|---|---|---|---|
+| 0.05-0.3 (edge-on) | 0.33 | 0.29 | 0.34 |
+| 0.3-0.6 | 0.29 | 0.62 | 0.45 |
+| 0.6-0.95 (face-on) | 0.66 | 0.78 | 0.85 |
+
+**What to expect.** g+ is close to its physical limit for edge-on disks. Overall
+it reaches about 75% of the perfect-data ceiling (0.42 vs 0.56). The headroom
+left is mostly in g× for inclined disks and in g+ for face-on disks. Further
+gains are most likely from more simulations (still increasing at 120k) and longer
+training on a GPU. Per-galaxy R^2 cannot approach 1 for g+ on this data set.
+Judge the model by sigma_eff and the calibration (m, c), not by R^2.
+
+Experiment log (all evaluated on the same validation/test galaxies):
+
+* E1: canonical CNN on real rows only. Memorises the 3,014 galaxies;
+  r(g+) peaks at 0.19, g× is never learned.
+* E2: + 60k sims (old forward model), no kinematic inputs. g+ improves, g× still ~0.
+* E3: + kinematic channels/statistics. g× learned (0.51 test). On held-out
+  sims r(g×) = 0.60 vs 0.49 on real, which revealed a sim-to-real gap.
+* Fixing the forward model (velocity field centred on the stamp origin; wider
+  continuum) cut the grism chi^2 by 17x. The gap closed: E4 gives held-out sims
+  0.373/0.522 and real 0.373/0.544.
+* E4 (60k corrected sims) gives test 0.405 / 0.556. E5 (120k corrected sims, 20% real)
+  gives test 0.416 / 0.580. An E4+E5 ensemble is equal on test (0.418 / 0.578) but
+  inherits a small g+ additive bias from E4, so E5 alone is the released model.
+
 
 ## Why the earlier models stalled (diagnosis)
 
@@ -44,9 +95,11 @@ Reverse-engineered conventions, each confirmed by chi^2 against `img.*_clean`
 | kinematics | thin disk, v_los = v0 + vcirc (2/pi) arctan(R/r_v) sin i cos(phi), velocity field **centred on the stamp origin** (not the Halpha centroid; this was the largest mismatch) | |
 | line | Gaussian line profile (truth.Halpha.dispersion), amplitude x0.93 | |
 | continuum | flat f_lambda over +-20 px (+-22 nm) of the line, amplitude x0.95 | |
-| grism total (4 rolls) | median 13-30, mean 60-75 per 4 stamps (about 1.5% of the noise variance) | |
+| grism, 200 random rows | per stamp: median 4.8, mean 14.6, 95th percentile 59 (about 1.4% of the noise variance on average) | |
 
-`validate_forward.py` reproduces these checks.
+`validate_forward.py` and `forward_validation_figure.py` reproduce these checks.
+
+![forward model validation](figs/forward_validation.png)
 
 ## Model (`train2.py`, `canon.py`, `kinfeat.py`)
 
@@ -102,19 +155,47 @@ information comes from galaxies with cos i > 0.6, so weighting matters.
 | `canon.py`, `kinfeat.py` | canonicalisation, kinematic channels and statistics |
 | `train2.py` | training (sims + real, fresh noise, EMA, sigma head) |
 | `evaluate.py`, `eval_sims.py` | pipeline metrics and plots; sim-domain evaluation |
+| `predict_split.py`, `calibrate.py` | val/test predictions; validation calibration of the de-shrunk estimator |
+| `summary_figure.py`, `forward_validation_figure.py` | figures in this README |
 | `predict.py` | inference / ensembling for new data -> CSV of g+, gx, sigma |
 | `common.py`, `train.py` | shared utilities; `train.py` = first plain-CNN baseline |
+
+## Released model
+
+`models/shearnet_E5.pt` is a self-contained checkpoint (weights, input
+normalisation, roll angles, noise levels). `models/shearnet_E5_calibration.json`
+holds the validation calibration, and `models/psf_os5.npz` holds the precomputed
+Roman PSF kernels used by the simulator.
+
+```bash
+python predict.py --ckpt models/shearnet_E5.pt --calib models/shearnet_E5_calibration.json \
+    --parquet new_galaxies.parquet --out shear_pred.csv
+```
+
+Columns `g_plus`, `g_cross`, `sigma_*` are the posterior mean and posterior
+sigma. `ghat_*`, `sigma_ghat_*` are the de-shrunk, calibrated per-galaxy
+estimates. Always combine them with weights `1/sigma_ghat^2`: uninformative
+galaxies get huge `sigma_ghat` and negligible weight. The model was trained for
+the v3 x10 grism depth, shear |g| < 0.1 and the v3 selection. Other depths or
+priors need new simulations (`gen_sims.py`) and retraining.
 
 ## Reproduce
 
 ```bash
 python prep_data.py --parquet kl_roman_nn_v3_lsnr10x.parquet --outdir DATA
 python make_psf_table.py DATA/../psf_os5.npz
-python gen_sims.py --data DATA --out SIMS_A --n 60000 --seed 11
-python train2.py --data DATA --sims SIMS_A --real_frac 0.15 --kin --epochs 30 --steps_per_epoch 400 --out RUN
-python evaluate.py RUN
+python gen_sims.py --data DATA --out SIMS_A --n 60000 --seed 11      # about 35 min on 4 CPU cores
+python gen_sims.py --data DATA --out SIMS_B --n 60000 --seed 12
+# what produced E5: E3 (old sims, 30 ep) -> E4 (SIMS_A, 20 ep, best at ep 5) -> E5 (A+B, 16 ep).
+# From scratch, a single run on A+B is the simplest equivalent:
+python train2.py --data DATA --sims SIMS_A SIMS_B --real_frac 0.2 --kin --epochs 40 --steps_per_epoch 500 --out RUN
+python predict_split.py --ckpt RUN/model.pt --out RUN && python calibrate.py RUN && python evaluate.py RUN
 python predict.py --ckpt RUN/model.pt --parquet new.parquet --out pred.csv
 ```
+
+Several scripts default to the paths used in development (`/home/user/data/...`);
+pass `--data`, `--psf_table` etc. explicitly. Training on 4 CPU cores takes
+about 100 s per 500-step epoch; a GPU will be much faster.
 
 Dependencies: numpy, pandas, pyarrow, torch (CPU is fine), galsim (Roman PSF),
 scipy, scikit-learn, lightgbm, matplotlib.
